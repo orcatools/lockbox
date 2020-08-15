@@ -3,14 +3,16 @@ package main
 import (
 	"encoding/gob"
 	"os"
+	"strings"
 )
 
 // KVFile offers minimal "kv store" features, but in a single file.
-// The focus here was more on functionality, and not performance.
+// The focus here was more on functionality, and not performance, due to its purpose.
 // It was designed to fit a specific need, and only focuses on that need.
 type KVFile struct {
 	Path    string // path to the kvfile
 	Entries map[string]map[string]string
+	// IsOpen bool // TODO: implement -- consider using rwmutex?
 }
 
 // New will create a new KVFile instance
@@ -76,4 +78,20 @@ func (kv *KVFile) Delete(bucket, key string) {
 func (kv *KVFile) CountKeys(bucket string) (count int) {
 	count = len(kv.Entries[bucket])
 	return
+}
+
+// PrefixScan will return all entries that match the given prefix from within the bucket
+func (kv *KVFile) PrefixScan(bucket, prefix string) (map[string]string, error) {
+	matches := map[string]string{}
+	for key, val := range kv.Entries[bucket] {
+		if strings.HasPrefix(key, prefix) {
+			matches[key] = val
+		}
+	}
+	return matches, nil
+}
+
+// GetAll will return all entries in the given bucket as a map
+func (kv *KVFile) GetAll(bucket string) (map[string]string, error) {
+	return kv.Entries[bucket], nil
 }

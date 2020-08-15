@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+
 	"github.com/sirupsen/logrus"
 )
 
@@ -21,9 +23,16 @@ func main() {
 	if err != nil {
 		logrus.Errorf(err.Error())
 	}
-	kv.Put("dan", "Hello", "World")
-	// val, err := kv.Get("dan", "Hello")
+	// kv.Put("dan", "keys/meh/1", "World")
+	// kv.Put("dan", "keys/meh/2", "Foo")
+	// kv.Put("dan", "keys/foo/1", "Bar")
+	// val, err := kv.Get("dan", "keys/meh/2")
 	// fmt.Println(val)
+	m, err := kv.GetAll("dan")
+	for k, v := range m {
+		fmt.Println(k, v)
+	}
+
 	err = kv.Close()
 	if err != nil {
 		logrus.Errorf(err.Error())
