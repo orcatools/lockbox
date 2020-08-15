@@ -1,6 +1,8 @@
 package main
 
-import "fmt"
+import (
+	"github.com/sirupsen/logrus"
+)
 
 func main() {
 
@@ -15,14 +17,15 @@ func main() {
 	// 	panic(err)
 	// }
 	// fmt.Println(message)
-	kv, err := Open("lockbox")
+	kv, err := New("lockbox")
 	if err != nil {
-		panic(err)
+		logrus.Errorf(err.Error())
 	}
 	kv.Put("dan", "Hello", "World")
-	fmt.Println(kv.CountKeys("dan"))
+	// val, err := kv.Get("dan", "Hello")
+	// fmt.Println(val)
 	err = kv.Close()
 	if err != nil {
-		panic(err)
+		logrus.Errorf(err.Error())
 	}
 }
