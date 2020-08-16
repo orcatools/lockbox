@@ -12,7 +12,6 @@ import (
 type KVFile struct {
 	Path    string // path to the kvfile
 	Entries map[string]map[string]string
-	// IsOpen bool // TODO: implement -- consider using rwmutex?
 }
 
 // NewKVFile will create a new KVFile instance
@@ -60,9 +59,8 @@ func (kv *KVFile) Put(bucket, key, value string) {
 }
 
 // Get will return the value of a given key from within the kvfile
-func (kv *KVFile) Get(bucket, key string) (val string, err error) {
-	val = kv.Entries[bucket][key]
-	return val, nil
+func (kv *KVFile) Get(bucket, key string) string {
+	return kv.Entries[bucket][key]
 }
 
 // Delete will delete the value of a given key from within the kvfile
