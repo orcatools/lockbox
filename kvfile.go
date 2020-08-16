@@ -1,4 +1,4 @@
-package main
+package lockbox
 
 import (
 	"encoding/gob"
@@ -15,8 +15,8 @@ type KVFile struct {
 	// IsOpen bool // TODO: implement -- consider using rwmutex?
 }
 
-// New will create a new KVFile instance
-func New(p string) (*KVFile, error) {
+// NewKVFile will create a new KVFile instance
+func NewKVFile(p string) (*KVFile, error) {
 	k := &KVFile{
 		Path:    p,
 		Entries: make(map[string]map[string]string),
