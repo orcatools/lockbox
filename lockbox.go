@@ -1,128 +1,207 @@
 package lockbox
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"time"
+
+	"github.com/pquerna/otp"
+	"github.com/pquerna/otp/totp"
+	bolt "go.etcd.io/bbolt"
 )
 
-// Permission defines required levels of access
-// type Permission struct {
-// }
+const (
+	lockboxbucket = "lockbox"
+)
 
-// A Lockbox provides portable storage for sensitive data.
+// A Lockbox provides portable, secure, storage for secrets.
 type Lockbox struct {
-	Root       string // path to the lockbox file
-	IsOpen     bool
-	Namespaces map[string][]*Item
+	Name      string
+	MasterKey string // this is the key used for initial encryption/decryption
+	Store     *bolt.DB
+	Locked    bool
+	OTPKey    *otp.Key // this is the totp key
 }
 
-// An Item represents anything stored within the Lockbox.
-type Item struct {
-	// TODO: add validation.
-	Path  string `json:"path"`  // path of the given item. Can be path like. eg. "/path/to/some/key.txt"
-	Value []byte `json:"value"` // value of the given item.
-	// Permissions []*Permission `json:"permissions"` // you can define required permissions for the given item
-}
-
-// NewLockbox will return an instance of a lockbox
-func NewLockbox(root string) (*Lockbox, error) {
-	defaultNamespace := map[string][]*Item{}
-	lockbox := &Lockbox{
-		Root:       root,
-		IsOpen:     true,
-		Namespaces: defaultNamespace,
+// GetLockbox will return an instance of lockbox
+func GetLockbox(name, master string) (*Lockbox, error) {
+	db, err := bolt.Open(fmt.Sprintf("%v.lockbox", name), 0600, nil)
+	if err != nil {
+		return nil, err
 	}
+
+	// create our default bucket
+	err = db.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists([]byte(lockboxbucket))
+		if err != nil {
+			return fmt.Errorf("create bucket: %s", err)
+		}
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	lockbox := &Lockbox{
+		Name:      name,
+		Store:     db,
+		Locked:    true,
+		MasterKey: master,
+	}
+	// NOTE: should encrypt it here?
 	return lockbox, nil
 }
 
-// ListNamespaces will list the defined namespaces within the lockbox.
-// Lockbox must be "opened" for this operation.
-func (l *Lockbox) ListNamespaces() ([]string, error) {
-	return nil, nil
+// Close will close the lockbox.
+func (l *Lockbox) Close() error {
+	// TODO: lock, serialize, etc, before close.
+
+	return l.Store.Close()
 }
 
-// Close will commit the lockbox to disk at its defined root
-func (l *Lockbox) Close(key string) error {
-	l.IsOpen = false
-	data, err := json.Marshal(l)
+// Init will perform initialization operations on the given lockbox
+func (l *Lockbox) Init(namespace string) error {
+	// write some data to the /lockbox/meta path
+	// eg: date created, date modifed, lockbox version
+	// eg: user defined access policies
+	// eg: totp meta data
+	// eg: other things we think of ?
+	created, err := time.Now().MarshalBinary()
 	if err != nil {
 		return err
 	}
-	edata := encrypt(data, key)
-	return ioutil.WriteFile(l.Root, edata, 0644)
-}
 
-// OpenLockbox will open the lockbox at the defined root, using the given key.
-func OpenLockbox(root, key string) (*Lockbox, error) {
-	var l Lockbox
-	edata, err := ioutil.ReadFile(root)
+	// updates the lockbox metadata for a given namespace
+	err = l.Store.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(lockboxbucket))
+		err := b.Put([]byte(fmt.Sprintf("/lockbox/meta/%v/date/created", namespace)), created)
+		return err
+	})
 	if err != nil {
-		return nil, err
+		return err
 	}
-	data := decrypt(edata, key)
-	err = json.Unmarshal(data, &l)
+
+	// generate the otp key
+	key, err := generateOTPKey(namespace)
+	fmt.Println("OTP SECRET:", key.Secret())
 	if err != nil {
-		return nil, err
+		return err
 	}
-	l.IsOpen = true
-	return &l, nil
-}
 
-// AddItem will add an item to the lockbox at the given namespace
-func (l *Lockbox) AddItem(namespace string, item *Item) error {
-	if l.IsOpen {
-		var canAddItem = true
-		for _, i := range l.Namespaces[namespace] {
-			if i.Path == item.Path {
-				canAddItem = false
-				break
-			}
-		}
-		if canAddItem {
-			l.Namespaces[namespace] = append(l.Namespaces[namespace], item)
-			return nil
-		}
-		return fmt.Errorf("an item at the path %v already exist in namespace %v", item.Path, namespace)
+	// encrypt the otp key with the master key
+	enckey, err := encrypt([]byte(key.String()), l.MasterKey)
+	if err != nil {
+		return err
 	}
-	return errors.New("unable to add item to a lockbox that is closed")
-}
+	// fmt.Println("ENCKEY SIZE:", len(enckey))
 
-// GetItem will get an item from the lockbox
-func (l *Lockbox) GetItem(namespace, path string) (*Item, error) {
-	if l.IsOpen {
-		for _, i := range l.Namespaces[namespace] {
-			if i.Path == path {
-				return i, nil
-			}
-		}
-		return nil, fmt.Errorf("item not found %v:%v", namespace, path)
-	}
-	return nil, errors.New("unable to get item from a lockbox that is closed")
-}
+	// store encrypted otp key within metadata for the namespace
+	err = l.Store.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(lockboxbucket))
+		err := b.Put([]byte(fmt.Sprintf("/lockbox/meta/%v/otp/key", namespace)), enckey)
+		return err
+	})
 
-// DeleteItem will delete an item from the lockbox
-func (l *Lockbox) DeleteItem(namespace, path string) error {
 	return nil
 }
 
-// NewItem will return a new item or error
-func NewItem(path string, value []byte) *Item {
-	i := &Item{
-		Path:  path,
-		Value: value,
+// GetMetaData will return lockbox metadata for given path
+func (l *Lockbox) GetMetaData(path string) ([]byte, error) {
+	var meta []byte
+	metapath := fmt.Sprintf("/lockbox/meta/%s", path)
+	l.Store.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(lockboxbucket))
+		meta = b.Get([]byte(metapath))
+		return nil
+	})
+	if len(meta) > 0 {
+		return meta, nil
 	}
-	// i.Seal("secret42") // TODO: handle this..
-	return i
+	return nil, errors.New("invalid metadata path")
 }
 
-// // Seal will encrypt the given item's value
-// func (i *Item) Seal(phrase string) {
-// 	i.Value = encrypt(i.Value, phrase)
-// }
+// IsLocked will check if the given lockbox is in a locked state, or not.
+// It will return True if the lockbox is locked.
+func (l *Lockbox) IsLocked() bool {
+	return l.Locked
+}
 
-// // Unseal will decrypt the given item's value
-// func (i *Item) Unseal(phrase string) {
-// 	i.Value = decrypt(i.Value, phrase)
-// }
+// Lock will lock the given lockbox
+func (l *Lockbox) Lock() error {
+	l.Locked = true
+	return nil
+}
+
+// Unlock will unlock the given lockbox, as long as the provided key[s] are valid.
+func (l *Lockbox) Unlock(namespace, code string) error {
+	enckey, err := l.GetMetaData(fmt.Sprintf("%v/otp/key", namespace))
+	// fmt.Println("ENCKEY SIZE:", len(enckey))
+	if err != nil {
+		return err
+	}
+	keyurl, err := decrypt(enckey, l.MasterKey)
+	if err != nil {
+		return err
+	}
+	key, err := otp.NewKeyFromURL(string(keyurl))
+	if err != nil {
+		return err
+	}
+
+	// fmt.Println(key.AccountName(), key.Secret())
+
+	valid := totp.Validate(code, key.Secret())
+
+	// // if the key is valid, then locked should be false.
+	l.Locked = !valid
+	return nil
+}
+
+// SetValue will set a value at a given path
+func (l *Lockbox) SetValue(value []byte, namespace, path string) error {
+	if l.Locked {
+		return errors.New("cannot set value while lockbox is locked")
+	}
+
+	// encrypt the value with the master key
+	// TODO: this only offers 1 layer of security.
+	// we need to figure out a smarter way to protect the values.
+	encval, err := encrypt(value, l.MasterKey)
+	if err != nil {
+		return err
+	}
+
+	return l.Store.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(lockboxbucket))
+		err := b.Put([]byte(fmt.Sprintf("/lockbox/value/%v/%v", namespace, path)), encval)
+		return err
+	})
+}
+
+// GetValue will get a value from a given path
+func (l *Lockbox) GetValue(namespace, path string) ([]byte, error) {
+	if l.Locked {
+		return nil, errors.New("cannot get value from a lockbox that is locked")
+	}
+	var encvalue []byte
+	datapath := fmt.Sprintf("/lockbox/value/%s/%s", namespace, path)
+	l.Store.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(lockboxbucket))
+		encvalue = b.Get([]byte(datapath))
+		return nil
+	})
+	if len(encvalue) > 0 {
+		value, err := decrypt(encvalue, l.MasterKey)
+		if err != nil {
+			return nil, err
+		}
+		return value, nil
+	}
+	return nil, errors.New("invalid data path")
+}
+
+// RemValue will remove the value at a given path
+func (l *Lockbox) RemValue(path string) error {
+	return nil
+}
