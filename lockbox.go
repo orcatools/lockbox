@@ -121,12 +121,6 @@ func (l *Lockbox) GetMetaData(path string) ([]byte, error) {
 	return nil, errors.New("invalid metadata path")
 }
 
-// IsLocked will check if the given lockbox is in a locked state, or not.
-// It will return True if the lockbox is locked.
-func (l *Lockbox) IsLocked() bool {
-	return l.Locked
-}
-
 // Lock will lock the given lockbox
 func (l *Lockbox) Lock() error {
 	l.Locked = true
