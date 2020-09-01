@@ -1,6 +1,7 @@
 package lockbox
 
 import (
+	"crypto/sha1"
 	"errors"
 	"fmt"
 	"time"
@@ -8,6 +9,7 @@ import (
 	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
 	bolt "go.etcd.io/bbolt"
+	"golang.org/x/crypto/pbkdf2"
 )
 
 const (
@@ -61,12 +63,15 @@ func (l *Lockbox) Close() error {
 }
 
 // Init will perform initialization operations on the given lockbox
-func (l *Lockbox) Init(namespace string) error {
+func (l *Lockbox) Init(namespace, salt string) error {
 	// write some data to the /lockbox/meta path
 	// eg: date created, date modifed, lockbox version
 	// eg: user defined access policies
 	// eg: totp meta data
 	// eg: other things we think of ?
+	if salt == "" {
+		return errors.New("salt is necessary to set the value")
+	}
 	created, err := time.Now().MarshalBinary()
 	if err != nil {
 		return err
@@ -90,7 +95,8 @@ func (l *Lockbox) Init(namespace string) error {
 	}
 
 	// encrypt the otp key with the master key
-	enckey, err := encrypt([]byte(key.String()), l.MasterKey)
+	securePassphrase := pbkdf2.Key([]byte(l.MasterKey), []byte(salt), 4096, 10, sha1.New)
+	enckey, err := encrypt([]byte(key.String()), string(securePassphrase))
 	if err != nil {
 		return err
 	}
@@ -128,13 +134,17 @@ func (l *Lockbox) Lock() error {
 }
 
 // Unlock will unlock the given lockbox, as long as the provided key[s] are valid.
-func (l *Lockbox) Unlock(namespace, code string) error {
+func (l *Lockbox) Unlock(namespace, code, salt string) error {
+	if salt == "" {
+		return errors.New("salt is necessary to set the value")
+	}
 	enckey, err := l.GetMetaData(fmt.Sprintf("%v/otp/key", namespace))
 	// fmt.Println("ENCKEY SIZE:", len(enckey))
 	if err != nil {
 		return err
 	}
-	keyurl, err := decrypt(enckey, l.MasterKey)
+	securePassphrase := pbkdf2.Key([]byte(l.MasterKey), []byte(salt), 4096, 10, sha1.New)
+	keyurl, err := decrypt(enckey, string(securePassphrase))
 	if err != nil {
 		return err
 	}
@@ -153,15 +163,16 @@ func (l *Lockbox) Unlock(namespace, code string) error {
 }
 
 // SetValue will set a value at a given path
-func (l *Lockbox) SetValue(value []byte, namespace, path string) error {
+func (l *Lockbox) SetValue(value []byte, namespace, path, salt string) error {
 	if l.Locked {
 		return errors.New("cannot set value while lockbox is locked")
 	}
 
-	// encrypt the value with the master key
-	// TODO: this only offers 1 layer of security.
-	// we need to figure out a smarter way to protect the values.
-	encval, err := encrypt(value, l.MasterKey)
+	if salt == "" {
+		return errors.New("salt is necessary to set the value")
+	}
+	storePassphrase := pbkdf2.Key([]byte(l.MasterKey), []byte(salt), 4096, 10, sha1.New)
+	encval, err := encrypt(value, string(storePassphrase))
 	if err != nil {
 		return err
 	}
@@ -174,10 +185,15 @@ func (l *Lockbox) SetValue(value []byte, namespace, path string) error {
 }
 
 // GetValue will get a value from a given path
-func (l *Lockbox) GetValue(namespace, path string) ([]byte, error) {
+func (l *Lockbox) GetValue(namespace, path, salt string) ([]byte, error) {
 	if l.Locked {
 		return nil, errors.New("cannot get value from a lockbox that is locked")
 	}
+
+	if salt == "" {
+		return nil, errors.New("salt is necessary to set the value")
+	}
+
 	var encvalue []byte
 	datapath := fmt.Sprintf("/lockbox/value/%s/%s", namespace, path)
 	l.Store.View(func(tx *bolt.Tx) error {
@@ -186,7 +202,8 @@ func (l *Lockbox) GetValue(namespace, path string) ([]byte, error) {
 		return nil
 	})
 	if len(encvalue) > 0 {
-		value, err := decrypt(encvalue, l.MasterKey)
+		securePassphrase := pbkdf2.Key([]byte(l.MasterKey), []byte(salt), 4096, 10, sha1.New)
+		value, err := decrypt(encvalue, string(securePassphrase))
 		if err != nil {
 			return nil, err
 		}
