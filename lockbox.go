@@ -85,10 +85,12 @@ func (l *Lockbox) Init(namespace, username, password string) (*otp.Key, error) {
 		// the acutal data. This should increase the security of lockbox by seperating
 		// this data, from secret data.
 		b := tx.Bucket([]byte(lockboxbucket))
-
-		// TODO: encrypt the username/password before storing it here...
-		// TODO: create a md5 checksum of the username to use as a lookup key
-		err := b.Put([]byte(fmt.Sprintf("/lockbox/meta/%v/users/%v", namespace, username)), []byte(password))
+		usernameHash := createHash(username)
+		encPassword, err := encrypt([]byte(password), usernameHash)
+		if err != nil {
+			return err
+		}
+		err = b.Put([]byte(fmt.Sprintf("/lockbox/meta/%v/users/%v", namespace, usernameHash)), []byte(encPassword))
 		return err
 	})
 
@@ -156,12 +158,18 @@ func (l *Lockbox) Unlock(namespace, username, password, code string) error {
 	}
 
 	// pw is the stored pw of the given username, we need to validate it against the provided password.
-	pw, err := l.GetMetaData(fmt.Sprintf("%v/users/%v", namespace, user.Username))
+	usernameHash := createHash(user.Username)
+	encpw, err := l.GetMetaData(fmt.Sprintf("%v/users/%v", namespace, usernameHash))
 	if err != nil {
-		return err
+		return errors.New("invalid username")
 	}
 
 	// user provided invalid password for given username
+	pw, err := decrypt(encpw, usernameHash)
+	if err != nil {
+		return errors.New("unable to unseal user metadata")
+	}
+
 	if password != string(pw) {
 		return errors.New("invalid password")
 	}

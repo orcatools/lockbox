@@ -17,3 +17,5 @@ type User struct {
 func (u *User) GetUserEncryptionKey() []byte {
 	return pbkdf2.Key([]byte(u.Password), []byte(u.Username), 1024, 128, sha512.New)
 }
+
+// TODO: add a validate method?
