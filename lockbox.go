@@ -1,15 +1,12 @@
 package lockbox
 
 import (
-	"crypto/sha1"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
 	bolt "go.etcd.io/bbolt"
-	"golang.org/x/crypto/pbkdf2"
 )
 
 const (
@@ -18,21 +15,21 @@ const (
 
 // A Lockbox provides portable, secure, storage for secrets.
 type Lockbox struct {
-	Name      string
-	MasterKey string // this is the key used for initial encryption/decryption
-	Store     *bolt.DB
-	Locked    bool
-	OTPKey    *otp.Key // this is the totp key
+	Name             string
+	Store            *bolt.DB
+	Locked           bool
+	CurrentUser      *User
+	CurrentNamespace string
 }
 
 // GetLockbox will return an instance of lockbox
-func GetLockbox(name, master string) (*Lockbox, error) {
-	db, err := bolt.Open(fmt.Sprintf("%v.lockbox", name), 0600, nil)
+func GetLockbox(lbname string) (*Lockbox, error) {
+	db, err := bolt.Open(lbname, 0600, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	// create our default bucket
+	// create our default buckets
 	err = db.Update(func(tx *bolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists([]byte(lockboxbucket))
 		if err != nil {
@@ -46,70 +43,82 @@ func GetLockbox(name, master string) (*Lockbox, error) {
 	}
 
 	lockbox := &Lockbox{
-		Name:      name,
-		Store:     db,
-		Locked:    true,
-		MasterKey: master,
+		Name:   lbname,
+		Store:  db,
+		Locked: true,
 	}
-	// NOTE: should encrypt it here?
+
 	return lockbox, nil
 }
 
 // Close will close the lockbox.
 func (l *Lockbox) Close() error {
-	// TODO: lock, serialize, etc, before close.
-
+	l.Locked = true
 	return l.Store.Close()
 }
 
 // Init will perform initialization operations on the given lockbox
-func (l *Lockbox) Init(namespace, salt string) error {
-	// write some data to the /lockbox/meta path
-	// eg: date created, date modifed, lockbox version
-	// eg: user defined access policies
-	// eg: totp meta data
-	// eg: other things we think of ?
-	if salt == "" {
-		return errors.New("salt is necessary to set the value")
-	}
-	created, err := time.Now().MarshalBinary()
-	if err != nil {
-		return err
-	}
+func (l *Lockbox) Init(namespace, username, password string) (*otp.Key, error) {
 
-	// updates the lockbox metadata for a given namespace
-	err = l.Store.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(lockboxbucket))
-		err := b.Put([]byte(fmt.Sprintf("/lockbox/meta/%v/date/created", namespace)), created)
-		return err
+	// make sure the bucket exist to contain our namespace
+	err := l.Store.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists([]byte(namespace))
+		if err != nil {
+			return fmt.Errorf("create bucket: %s", err)
+		}
+		return nil
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
+
+	// we need a user to initialize the lockbox
+	// NOTE: should this user default to "root"?
+	user := &User{
+		Username: username,
+		Password: password,
+	}
+	// TODO: validate user struct
+
+	err = l.Store.Update(func(tx *bolt.Tx) error {
+		// we write metadata to the lockbox bucket, which is stored seperately from
+		// the acutal data. This should increase the security of lockbox by seperating
+		// this data, from secret data.
+		b := tx.Bucket([]byte(lockboxbucket))
+
+		// TODO: encrypt the username/password before storing it here...
+		// TODO: create a md5 checksum of the username to use as a lookup key
+		err := b.Put([]byte(fmt.Sprintf("/lockbox/meta/%v/users/%v", namespace, username)), []byte(password))
+		return err
+	})
 
 	// generate the otp key
-	key, err := generateOTPKey(namespace)
-	fmt.Println("OTP SECRET:", key.Secret())
+	otpkey, err := generateOTPKey(namespace)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// encrypt the otp key with the master key
-	securePassphrase := pbkdf2.Key([]byte(l.MasterKey), []byte(salt), 4096, 10, sha1.New)
-	enckey, err := encrypt([]byte(key.String()), string(securePassphrase))
+	// encrypt the otp key with the user's encryption key
+	encotpkey, err := encrypt([]byte(otpkey.String()), string(user.GetUserEncryptionKey()))
 	if err != nil {
-		return err
+		return nil, err
 	}
-	// fmt.Println("ENCKEY SIZE:", len(enckey))
 
 	// store encrypted otp key within metadata for the namespace
 	err = l.Store.Update(func(tx *bolt.Tx) error {
+		// we write metadata to the lockbox bucket, which is stored seperately from
+		// the acutal data. This should increase the security of lockbox by seperating
+		// this data, from secret data.
 		b := tx.Bucket([]byte(lockboxbucket))
-		err := b.Put([]byte(fmt.Sprintf("/lockbox/meta/%v/otp/key", namespace)), enckey)
+		err := b.Put([]byte(fmt.Sprintf("/lockbox/meta/%v/otp/key", namespace)), encotpkey)
 		return err
 	})
+	if err != nil {
+		return nil, err
+	}
 
-	return nil
+	// NOTE: it is the caller's job to retrieve the secret from the otpkey.
+	return otpkey, nil
 }
 
 // GetMetaData will return lockbox metadata for given path
@@ -134,76 +143,82 @@ func (l *Lockbox) Lock() error {
 }
 
 // Unlock will unlock the given lockbox, as long as the provided key[s] are valid.
-func (l *Lockbox) Unlock(namespace, code, salt string) error {
-	if salt == "" {
-		return errors.New("salt is necessary to set the value")
-	}
-	enckey, err := l.GetMetaData(fmt.Sprintf("%v/otp/key", namespace))
-	// fmt.Println("ENCKEY SIZE:", len(enckey))
-	if err != nil {
-		return err
-	}
-	securePassphrase := pbkdf2.Key([]byte(l.MasterKey), []byte(salt), 4096, 10, sha1.New)
-	keyurl, err := decrypt(enckey, string(securePassphrase))
-	if err != nil {
-		return err
-	}
-	key, err := otp.NewKeyFromURL(string(keyurl))
+func (l *Lockbox) Unlock(namespace, username, password, code string) error {
+	// get our encrypted otp key from the metadata store
+	encotpkey, err := l.GetMetaData(fmt.Sprintf("%v/otp/key", namespace))
 	if err != nil {
 		return err
 	}
 
-	// fmt.Println(key.AccountName(), key.Secret())
+	user := &User{
+		Username: username,
+		Password: password,
+	}
 
-	valid := totp.Validate(code, key.Secret())
+	// pw is the stored pw of the given username, we need to validate it against the provided password.
+	pw, err := l.GetMetaData(fmt.Sprintf("%v/users/%v", namespace, user.Username))
+	if err != nil {
+		return err
+	}
 
-	// // if the key is valid, then locked should be false.
+	// user provided invalid password for given username
+	if password != string(pw) {
+		return errors.New("invalid password")
+	}
+
+	user.EncryptionKey = string(user.GetUserEncryptionKey())
+
+	keyurl, err := decrypt(encotpkey, user.EncryptionKey)
+	if err != nil {
+		return err
+	}
+	otpkey, err := otp.NewKeyFromURL(string(keyurl))
+	if err != nil {
+		return err
+	}
+	valid := totp.Validate(code, otpkey.Secret())
+
+	// if the key is valid, then locked should be false.
 	l.Locked = !valid
+	l.CurrentUser = user
+	l.CurrentNamespace = namespace
 	return nil
 }
 
 // SetValue will set a value at a given path
-func (l *Lockbox) SetValue(value []byte, namespace, path, salt string) error {
+func (l *Lockbox) SetValue(path, value []byte) error {
 	if l.Locked {
 		return errors.New("cannot set value while lockbox is locked")
 	}
 
-	if salt == "" {
-		return errors.New("salt is necessary to set the value")
-	}
-	storePassphrase := pbkdf2.Key([]byte(l.MasterKey), []byte(salt), 4096, 10, sha1.New)
-	encval, err := encrypt(value, string(storePassphrase))
+	// encrypt the provided value with the current users encryption key.
+	encval, err := encrypt(value, l.CurrentUser.EncryptionKey)
 	if err != nil {
 		return err
 	}
 
+	// store the encrypted value at the desired path
 	return l.Store.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(lockboxbucket))
-		err := b.Put([]byte(fmt.Sprintf("/lockbox/value/%v/%v", namespace, path)), encval)
+		b := tx.Bucket([]byte(l.CurrentNamespace))
+		err := b.Put(path, encval)
 		return err
 	})
 }
 
 // GetValue will get a value from a given path
-func (l *Lockbox) GetValue(namespace, path, salt string) ([]byte, error) {
+func (l *Lockbox) GetValue(path []byte) ([]byte, error) {
 	if l.Locked {
 		return nil, errors.New("cannot get value from a lockbox that is locked")
 	}
 
-	if salt == "" {
-		return nil, errors.New("salt is necessary to set the value")
-	}
-
 	var encvalue []byte
-	datapath := fmt.Sprintf("/lockbox/value/%s/%s", namespace, path)
 	l.Store.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(lockboxbucket))
-		encvalue = b.Get([]byte(datapath))
+		b := tx.Bucket([]byte(l.CurrentNamespace))
+		encvalue = b.Get(path)
 		return nil
 	})
 	if len(encvalue) > 0 {
-		securePassphrase := pbkdf2.Key([]byte(l.MasterKey), []byte(salt), 4096, 10, sha1.New)
-		value, err := decrypt(encvalue, string(securePassphrase))
+		value, err := decrypt(encvalue, l.CurrentUser.EncryptionKey)
 		if err != nil {
 			return nil, err
 		}
