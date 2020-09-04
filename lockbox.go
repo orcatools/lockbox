@@ -57,8 +57,47 @@ func (l *Lockbox) Close() error {
 	return l.Store.Close()
 }
 
-// Init will perform initialization operations on the given lockbox
-func (l *Lockbox) Init(namespace, username, password string) (*otp.Key, error) {
+// CheckMFA will check if the given namespace has MFA enabled, or not.
+// returns true if mfa is enabled
+func (l *Lockbox) CheckMFA(namespace string) (bool, error) {
+	_, err := l.GetMetaData(fmt.Sprintf("%v/otp/key", namespace))
+	if err != nil {
+		// check if error is that key doesn't exist?
+	}
+	return true, nil
+}
+
+// Init will initalize a namespace for use, without mfa.
+func (l *Lockbox) Init(namespace, username, password string) error {
+	// make sure the bucket exist to contain our namespace
+	err := l.Store.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists([]byte(namespace))
+		if err != nil {
+			return fmt.Errorf("create bucket: %s", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	err = l.Store.Update(func(tx *bolt.Tx) error {
+		// we write metadata to the lockbox bucket, which is stored seperately from
+		// the acutal data. This should increase the security of lockbox by seperating
+		// this data, from secret data.
+		b := tx.Bucket([]byte(lockboxbucket))
+		usernameHash := createHash(username)
+		encPassword, err := encrypt([]byte(password), usernameHash)
+		if err != nil {
+			return err
+		}
+		err = b.Put([]byte(fmt.Sprintf("/lockbox/meta/%v/users/%v", namespace, usernameHash)), []byte(encPassword))
+		return err
+	})
+	return nil
+}
+
+// InitWithMFA will perform initialization operations on the given lockbox, enabling MFA.
+func (l *Lockbox) InitWithMFA(namespace, username, password string) (*otp.Key, error) {
 
 	// make sure the bucket exist to contain our namespace
 	err := l.Store.Update(func(tx *bolt.Tx) error {
@@ -144,8 +183,57 @@ func (l *Lockbox) Lock() error {
 	return nil
 }
 
-// Unlock will unlock the given lockbox, as long as the provided key[s] are valid.
-func (l *Lockbox) Unlock(namespace, username, password, code string) error {
+// Unlock will unlock the lockbox as long as mfa is NOT enabled
+func (l *Lockbox) Unlock(namespace, username, password string) error {
+	// pw is the stored pw of the given username, we need to validate it against the provided password.
+	usernameHash := createHash(username)
+	encpw, err := l.GetMetaData(fmt.Sprintf("%v/users/%v", namespace, usernameHash))
+	if err != nil {
+		return errors.New("invalid username")
+	}
+
+	// user provided invalid password for given username
+	pw, err := decrypt(encpw, usernameHash)
+	if err != nil {
+		return errors.New("unable to unseal user metadata")
+	}
+
+	if password != string(pw) {
+		return errors.New("invalid password")
+	}
+
+	user := &User{
+		Username: username,
+		Password: password,
+	}
+
+	// check if the namespace exists..
+	l.Store.View(func(tx *bolt.Tx) error {
+		nsb := tx.Bucket([]byte(namespace))
+		if nsb == nil {
+			return fmt.Errorf("cannot unlock lockbox. The namespace '%v' does not exist", namespace)
+		}
+		return nil
+	})
+
+	// check if the namespace requires mfa
+	mfa, err := l.CheckMFA(namespace)
+	if err != nil {
+		return err
+	}
+	if mfa {
+		return fmt.Errorf("cannot unlock lockbox. The namespace '%v' has MFA enabled", namespace)
+	}
+
+	l.Locked = false
+	l.CurrentUser = user
+	l.CurrentNamespace = namespace
+
+	return nil
+}
+
+// UnlockWithMFA will unlock the given lockbox, as long as the provided key[s]/codes are valid.
+func (l *Lockbox) UnlockWithMFA(namespace, username, password, code string) error {
 	// get our encrypted otp key from the metadata store
 	encotpkey, err := l.GetMetaData(fmt.Sprintf("%v/otp/key", namespace))
 	if err != nil {
