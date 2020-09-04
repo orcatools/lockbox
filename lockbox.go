@@ -62,7 +62,10 @@ func (l *Lockbox) Close() error {
 func (l *Lockbox) CheckMFA(namespace string) (bool, error) {
 	_, err := l.GetMetaData(fmt.Sprintf("%v/otp/key", namespace))
 	if err != nil {
-		// check if error is that key doesn't exist?
+		if err.Error() == "invalid metadata path" {
+			return false, nil
+		}
+		return false, err
 	}
 	return true, nil
 }
